@@ -1,65 +1,157 @@
 import { configureStore, createSlice, type PayloadAction } from '@reduxjs/toolkit';
-import { createApi, fakeBaseQuery } from '@reduxjs/toolkit/query/react';
 import Taro from '@tarojs/taro';
+import { audit, deviceNow, makeHandoff, processPacket, submitReview } from '../patrol/ingest';
+import { createSeedState } from '../patrol/seed';
+import type {
+  HandoffEntry, MissingMaterial, OutboundPacket, PacketEntry, PatrolState, ReviewTarget, Risk
+} from '../patrol/types';
 
-export type SyncState = 'local' | 'queued' | 'synced' | 'conflict';
-export interface PatrolObservation { id: string; time: string; note: string; risk: 'low' | 'medium' | 'high'; sync: SyncState; reviewed: boolean; }
-export interface TrackPoint { id: string; latitude: number; longitude: number; at: string; source: 'gps' | 'manual'; }
-export interface Sample { id: string; code: string; species: string; count: number; status: 'draft' | 'submitted' | 'verified'; }
-interface State { observations: PatrolObservation[]; points: TrackPoint[]; samples: Sample[]; conflict: string | null; }
+const STORAGE_KEY = 'yf57-patrol-state-v2';
 
-const seed: State = {
-  observations: [
-    { id: 'o1', time: '2026-09-29 07:20', note: '东坡发现新鲜足迹，沿溪谷方向移动', risk: 'medium', sync: 'synced', reviewed: false },
-    { id: 'o2', time: '2026-09-29 08:05', note: '红外相机外壳松动，已拍照待补报', risk: 'high', sync: 'queued', reviewed: false },
-    { id: 'o3', time: '2026-09-29 08:40', note: '样线南段没有异常', risk: 'low', sync: 'synced', reviewed: true }
-  ],
-  points: [
-    { id: 'p1', latitude: 30.5821, longitude: 103.2174, at: '07:20', source: 'gps' },
-    { id: 'p2', latitude: 30.5856, longitude: 103.2211, at: '08:05', source: 'gps' }
-  ],
-  samples: [{ id: 's1', code: 'WD-0929-01', species: '疑似豹猫毛发', count: 1, status: 'submitted' }],
-  conflict: null
-};
-
-function readState(): State {
-  try { const saved = Taro.getStorageSync('yf57-patrol-state'); return saved ? JSON.parse(saved) as State : seed; } catch { return seed; }
+function readState(): PatrolState {
+  try {
+    const saved = Taro.getStorageSync(STORAGE_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved) as PatrolState;
+      if (parsed.version === 2) return parsed;
+    }
+  } catch { /* 落库损坏时回退种子 */ }
+  return createSeedState();
 }
 
+function nextEntryId(state: PatrolState): { id: string; ordinal: number } {
+  const device = state.devices[state.selfDeviceId];
+  const ordinal = device.nextOrdinal;
+  device.nextOrdinal += 1;
+  return { id: `e-${state.selfDeviceId}-${ordinal}`, ordinal };
+}
+
+type NewObservation = { note: string; risk: Risk; evidencePhoto: boolean; withinCapability: boolean; latitude?: number; longitude?: number; sampleCode?: string };
+type NewSample = { code: string; species: string; count: number; photo: boolean; labeled: boolean };
+
 const slice = createSlice({
-  name: 'patrol', initialState: readState(),
+  name: 'patrol',
+  initialState: readState,
   reducers: {
-    addObservation: (state, action: PayloadAction<Omit<PatrolObservation, 'id' | 'time' | 'sync' | 'reviewed'>>) => {
-      state.observations.unshift({ id: `o-${Date.now()}`, time: new Date().toLocaleString(), ...action.payload, sync: 'queued', reviewed: false });
+    addDraftObservation: (state, action: PayloadAction<NewObservation>) => {
+      const { id, ordinal } = nextEntryId(state);
+      const entry: PacketEntry = {
+        id, ordinal, kind: 'observation', at: deviceNow(state.clockOffsetMin),
+        collector: state.currentUser, ...action.payload
+      };
+      state.draft.push(entry);
+      audit(state, state.currentUser, `草稿新增观察 #${ordinal}`);
     },
-    addPoint: (state, action: PayloadAction<{ latitude: number; longitude: number }>) => {
-      state.points.push({ id: `p-${Date.now()}`, ...action.payload, at: new Date().toLocaleTimeString(), source: 'gps' });
+    addDraftTrack: (state, action: PayloadAction<{ latitude: number; longitude: number }>) => {
+      const { id, ordinal } = nextEntryId(state);
+      state.draft.push({
+        id, ordinal, kind: 'track', at: deviceNow(state.clockOffsetMin), collector: state.currentUser,
+        latitude: action.payload.latitude, longitude: action.payload.longitude, source: 'gps'
+      });
     },
-    addSample: (state, action: PayloadAction<{ code: string; species: string; count: number }>) => {
-      state.samples.unshift({ id: `s-${Date.now()}`, ...action.payload, status: 'draft' });
+    addDraftSample: (state, action: PayloadAction<NewSample>) => {
+      const { id, ordinal } = nextEntryId(state);
+      state.draft.push({
+        id, ordinal, kind: 'sample', at: deviceNow(state.clockOffsetMin), collector: state.currentUser, ...action.payload
+      });
     },
-    syncQueue: (state) => {
-      state.observations = state.observations.map((item) => item.sync === 'queued' ? { ...item, sync: 'conflict' } : item);
-      state.conflict = '服务器上已有同一巡护记录，请选择保留本地版本或合并负责人复核意见。';
+    // 草稿封包：设备内连续序号 + 稳定巡护标识
+    sealPacket: (state) => {
+      if (state.draft.length === 0) return;
+      const device = state.devices[state.selfDeviceId];
+      device.lastSeq += 1;
+      const seq = device.lastSeq;
+      const packet: OutboundPacket = {
+        id: `PK-${state.selfDeviceId}-${seq}`,
+        deviceId: state.selfDeviceId,
+        patrolId: state.patrolId,
+        seq,
+        sealedAt: deviceNow(0),
+        clockOffsetMin: state.clockOffsetMin,
+        status: 'pending',
+        sentCount: 0,
+        entries: state.draft
+      };
+      state.outbound.push(packet);
+      state.draft = [];
+      audit(state, state.currentUser, `封包 ${state.selfDeviceId}#${seq}（${packet.entries.length} 条，巡护 ${state.patrolId}）`);
     },
-    resolveConflict: (state, action: PayloadAction<'local' | 'remote'>) => {
-      state.observations = state.observations.map((item) => item.sync === 'conflict' ? { ...item, sync: 'synced' } : item);
-      state.conflict = null;
-      Taro.setStorageSync('yf57-conflict-resolution', action.payload);
+    // 断网恢复：所有待同步包按设备序号依次入库；包内某条失败不影响其他条目
+    syncAll: (state) => {
+      const pending = state.outbound
+        .filter((p) => p.status === 'pending' && !p.firstResult)
+        .sort((a, b) => (a.deviceId === b.deviceId ? a.seq - b.seq : a.deviceId.localeCompare(b.deviceId)));
+      pending.forEach((packet) => {
+        packet.sentCount += 1;
+        processPacket(state, packet);
+      });
     },
-    reviewObservation: (state, action: PayloadAction<string>) => {
-      const item = state.observations.find((entry) => entry.id === action.payload); if (item) item.reviewed = true;
+    // 重传：沿用第一次处理结果，不重新判重、不覆盖结论
+    retransmit: (state, action: PayloadAction<string>) => {
+      const packet = state.outbound.find((p) => p.id === action.payload);
+      if (packet) {
+        packet.sentCount += 1;
+        packet.lastRetransmitAt = deviceNow(0);
+        audit(state, state.currentUser, `重传 ${packet.deviceId}#${packet.seq}：沿用首次结果，未重新处理`);
+      }
     },
-    verifySample: (state, action: PayloadAction<string>) => {
-      const item = state.samples.find((entry) => entry.id === action.payload); if (item) item.status = 'verified';
+    // 站点侧：样本交接 / 送检，封成即发，走同一条入库链路
+    sendHandoff: (state, action: PayloadAction<Omit<HandoffEntry, 'id' | 'ordinal' | 'at' | 'collector' | 'kind'>>) => {
+      const entry = makeHandoff(state, action.payload);
+      const device = state.devices[state.selfDeviceId];
+      device.nextOrdinal += 1;
+      device.lastSeq += 1;
+      const packet: OutboundPacket = {
+        id: `PK-${state.selfDeviceId}-${device.lastSeq}`,
+        deviceId: state.selfDeviceId, patrolId: state.patrolId, seq: device.lastSeq,
+        sealedAt: deviceNow(0), clockOffsetMin: 0, status: 'pending', sentCount: 1, entries: [entry]
+      };
+      state.outbound.push(packet);
+      processPacket(state, packet);
+    },
+    // 退回后补齐材料：进入当前设备草稿，封包后从退回点继续
+    addDraftSupplement: (state, action: PayloadAction<{ targetType: ReviewTarget; targetKey: string; materials: MissingMaterial[]; note: string }>) => {
+      const { id, ordinal } = nextEntryId(state);
+      state.draft.push({ id, ordinal, kind: 'supplement', at: deviceNow(0), collector: state.currentUser, ...action.payload });
+    },
+    review: (state, action: PayloadAction<{ targetType: ReviewTarget; targetKey: string; status: 'approved' | 'returned'; reviewer: string; note: string }>) => {
+      submitReview(state, action.payload);
+    },
+    setClockOffset: (state, action: PayloadAction<number>) => { state.clockOffsetMin = action.payload; },
+    switchDevice: (state, action: PayloadAction<string>) => {
+      state.selfDeviceId = action.payload;
+      state.currentUser = state.devices[action.payload].user;
+      state.clockOffsetMin = 0;
+    },
+    // 旧机升级：旧记录仍在（只有采集人与时间），之后可正常查看与交接
+    upgradeDevice: (state, action: PayloadAction<string>) => {
+      const device = state.devices[action.payload];
+      if (device) device.appVersion = 2;
+      audit(state, device?.user ?? 'system', `${action.payload} 已升级到新版 App，历史记录全部保留`);
+    },
+    resetDemo: (state) => {
+      const fresh = createSeedState();
+      Object.assign(state, fresh);
+      Taro.setStorageSync(STORAGE_KEY, JSON.stringify(fresh));
     }
   }
 });
 
-export const patrolApi = createApi({ reducerPath: 'patrolApi', baseQuery: fakeBaseQuery(), endpoints: (builder) => ({ connection: builder.query<{ online: boolean }, void>({ queryFn: () => ({ data: { online: true } }) }) }) });
-export const { useConnectionQuery } = patrolApi;
-export const { addObservation, addPoint, addSample, resolveConflict, reviewObservation, syncQueue, verifySample } = slice.actions;
-export const store = configureStore({ reducer: { patrol: slice.reducer, [patrolApi.reducerPath]: patrolApi.reducer }, middleware: (getDefault) => getDefault().concat(patrolApi.middleware) });
-if (typeof window !== 'undefined') store.subscribe(() => Taro.setStorageSync('yf57-patrol-state', JSON.stringify(store.getState().patrol)));
+export const {
+  addDraftObservation, addDraftTrack, addDraftSample, sealPacket, syncAll, retransmit,
+  sendHandoff, addDraftSupplement, review, setClockOffset, switchDevice, upgradeDevice, resetDemo
+} = slice.actions;
+
+export const store = configureStore({ reducer: { patrol: slice.reducer } });
+
+let writeTimer: ReturnType<typeof setTimeout> | undefined;
+store.subscribe(() => {
+  if (typeof setTimeout === 'undefined') {
+    Taro.setStorageSync(STORAGE_KEY, JSON.stringify(store.getState().patrol));
+    return;
+  }
+  clearTimeout(writeTimer);
+  writeTimer = setTimeout(() => Taro.setStorageSync(STORAGE_KEY, JSON.stringify(store.getState().patrol)), 120);
+});
 
 export type RootState = ReturnType<typeof store.getState>;
